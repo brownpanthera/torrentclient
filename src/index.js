@@ -4,7 +4,7 @@ import crypto from "crypto";
 
 import { connectionReq } from "./tracker.js";
 
-const torrent = bencode.decode(fs.readFileSync("./torrents/spiderman.torrent"));
+const torrent = bencode.decode(fs.readFileSync("./torrents/moana.torrent"));
 
 // Convert Uint8Array to Buffer then String
 // const decoder = new TextDecoder("utf-8")

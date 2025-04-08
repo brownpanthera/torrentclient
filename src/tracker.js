@@ -3,6 +3,13 @@ import crypto from "crypto"
 import { URL } from "url"
 import { infoHash, torrentFileSize } from "./index.js"
 
+function validateResponse(condition, errorMessage) {
+    if (!condition) {
+        console.error(errorMessage);
+        process.exit(1);
+    }
+}
+
 export function connectionReq(announceURL){
     const randomNumber = crypto.randomBytes(4).readUInt32BE();
     const buff = Buffer.alloc(16)
@@ -21,20 +28,12 @@ export function connectionReq(announceURL){
 
     // console.log("sending buffer", buff.toString("hex"));
 
-    // extracting the res which is same as req
     socket.on("error", (err)=>{
         console.err("socet error ", err)
     })
-
-
-
-    function validateResponse(condition, errorMessage) {
-        if (!condition) {
-            console.error(errorMessage);
-            process.exit(1);
-        }
-    }
     
+    
+    // extracting the res which is same as req
     socket.on("message", (msg, rinfo) => {
         console.log(rinfo)
         const actionID = msg.readUInt32BE(0);
@@ -47,8 +46,8 @@ export function connectionReq(announceURL){
         validateResponse(transactionID === randomNumber, "Error: Transaction ID does not match the one that was generated.");
         validateResponse(actionID === 0, "Unexpected Action ID, expected a connection response.");
 
-
         console.table({ actionID, transactionID, connectionID });
+
         console.log(infoHash)
         console.log(torrentFileSize())
         socket.close()
@@ -84,7 +83,6 @@ function announceReq(announceURL, connectionID){
     client.send(requestBuff, 0, requestBuff.length, port, hostname, (err)=> {
         if(err) console.error("Error sending req", err)
             else console.log("Announce Req send")
-        
     })
 
     client.on("message", (msg, rinfo) => {
@@ -94,13 +92,34 @@ function announceReq(announceURL, connectionID){
     const leechers = msg.readUInt32BE(12);
     const seeders = msg.readUInt32BE(16);
 
+    // console.log(listofPeers)
+
     if(actionID !== 1){
         console.error("unexpected action ID, expected announce res")
         return
     }
 
-    console.log(interval)
-    console.log(leechers)
-    console.log(seeders)
+    // converting ip int to string
+    let listofPeers = [];
+    for(let i = 20; i < msg.length; i+=6){
+        const ipofpeers = msg.readUInt32BE(i)
+        const portofpeers = msg.readUInt16BE(i+4)
+
+        const ip = [
+            (ipofpeers >> 24) & 0xff,
+            (ipofpeers >> 16) & 0xff,
+            (ipofpeers >> 8) & 0xff,
+            ipofpeers & 0xff
+        ].join('.')
+        listofPeers.push({ip: ip, port: portofpeers})
+    }
+
+    console.log(listofPeers)
+
+
+    // console.log(actionID)
+    // console.log(leechers)
+    // console.log(seeders)
+    console.log(msg.length)
     })
 }
