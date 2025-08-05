@@ -4,8 +4,10 @@ import crypto from "crypto";
 
 import { connectionReq } from "./tracker.js";
 
-const torrent = bencode.decode(fs.readFileSync("./torrents/moana.torrent"));
+const torrent = bencode.decode(fs.readFileSync("./torrents/yourTorrent.torrent"));
+const fileTorrentName = Buffer.from(torrent.info.name).toString('utf-8')
 export { torrent };
+export {fileTorrentName}
 
 // calculating how many pieces i need to download
 export function getTotalPiece() {
@@ -23,7 +25,7 @@ export function getTotalPiece() {
 }
 
 
-console.dir(torrent, null, 2);
+// console.dir(torrent, null, 2);
 
 // Convert Uint8Array to Buffer then String
 // const decoder = new TextDecoder("utf-8")

@@ -1,9 +1,10 @@
 import dgram, { Socket } from "dgram";
 import crypto from "crypto";
 import { URL } from "url";
-import { infoHash, torrentFileSize } from "./index.js";
+import { infoHash, torrentFileSize, torrent } from "./index.js";
 import net from "net";
 import { getTotalPiece } from "./index.js";
+import fs from "fs";
 
 // global peerID to use across functions
 export const peerID = crypto.randomBytes(20);
@@ -26,6 +27,13 @@ function createRequest(pieceIndex, begin, length) {
   return buffer;
 }
 
+function createInterestedMessage() {
+  const buffer = Buffer.alloc(5);
+  buffer.writeUInt32BE(1, 0); // length: 1 byte for message ID
+  buffer.writeUInt8(2, 4);    // message ID: 2 = interested
+  return buffer;
+}
+
 export function connectionReq(announceURL) {
   const randomNumber = crypto.randomBytes(4).readUInt32BE();
   const buff = Buffer.alloc(16);
@@ -34,18 +42,40 @@ export function connectionReq(announceURL) {
   buff.writeUInt32BE(0, 8); // action ID
   buff.writeUInt32BE(randomNumber, 12); // random transaction ID
 
-  const url = new URL(announceURL);
+  // Clean URL and validate
+  const cleanURL = announceURL.replace(/[^\x20-\x7E]/g, ''); // Remove non-printable chars
+  console.log(`tracker url: ${cleanURL}`);
+  
+  let url;
+  try {
+    url = new URL(cleanURL);
+  } catch (err) {
+    console.error(`invalid tracker url: ${cleanURL}`);
+    console.error(`   error: ${err.message}`);
+    return;
+  }
+  
+  // Validate UDP tracker
+  if (url.protocol !== 'udp:') {
+    console.error(`only udp trackers supported got: ${url.protocol}`);
+    return;
+  }
+  
+  // Default port for UDP trackers
+  const port = url.port || 80;
+  console.log(`connecting to tracker: ${url.hostname}:${port}`);
 
   // sendin udp req to tracker
   const socket = dgram.createSocket("udp4");
-  socket.send(buff, 0, buff.length, url.port, url.hostname, () => {
-    console.log(`sent connection req to ${url.hostname}, ${url.port}`);
+  socket.send(buff, 0, buff.length, port, url.hostname, () => {
+    console.log(`sent connection request to ${url.hostname}:${port}`);
   });
 
   // console.log("sending buffer", buff.toString("hex"));
 
   socket.on("error", (err) => {
-    console.err("socet error ", err);
+    console.error(`tracker connection error: ${err.message}`);
+    socket.close();
   });
 
   // extracting the res which is same as req
@@ -92,7 +122,7 @@ export function announceReq(announceURL, connectionID) {
   requestBuff.writeBigUInt64BE(BigInt(0), 56);
   requestBuff.writeBigUInt64BE(BigInt(torrentFileSize()), 64);
   requestBuff.writeBigUInt64BE(BigInt(0), 48);
-  requestBuff.writeUint32BE(2, 80);
+  requestBuff.writeUInt32BE(2, 80);
   requestBuff.writeUInt32BE(0, 84);
   requestBuff.writeUInt32BE(crypto.randomInt(0, 2 ** 32), 88);
   requestBuff.writeInt32BE(-1, 92);
@@ -150,6 +180,35 @@ function connectToPeers(listofPeers) {
     console.log(`Attempting to connect to ${listofPeers.length} peers...`);
   }
 
+  // Create torrent-specific pieces directory
+  const torrentHash = infoHash.toString('hex').slice(0, 8);
+  const piecesDir = `pieces`;
+  
+  if (!fs.existsSync(piecesDir)) {
+    fs.mkdirSync(piecesDir);
+    console.log(`created pieces directory: ${piecesDir}`);
+  } else {
+    console.log(`using existing pieces directory: ${piecesDir}`);
+  }
+
+  // Global download tracking
+  const peerState = new Map();
+  const downloadedPieces = new Set();
+  const pieceProgress = new Map(); // Track partial piece downloads
+  const totalPieces = getTotalPiece();
+  let cnt = 0;
+
+  function getPieceSize(pieceIndex) {
+    const totalSize = torrentFileSize();
+    const pieceLength = torrent.info['piece length'];
+    
+    if (pieceIndex === totalPieces - 1) {
+      // Last piece might be smaller
+      return totalSize - (pieceIndex * pieceLength);
+    }
+    return pieceLength;
+  }
+
   // Handshake Buffer
   function handShakeBuffer() {
     const buffer = Buffer.alloc(68);
@@ -174,8 +233,12 @@ function connectToPeers(listofPeers) {
 
   // making a req through socket
   for (const { ip, port } of listofPeers) {
+    let messageBuffer = Buffer.alloc(0);
+    let handshakeComplete = false;
+    let peerKey = `${ip}:${port}`;
+    
     const socket = net.connect({ host: ip, port: port }, () => {
-      console.log(`Connected to peer: ${ip}:${port}`);
+      console.log(`connected to peer: ${ip}:${port}`);
 
       // Send the handshake after connection is established
       const handshake = handShakeBuffer();
@@ -183,77 +246,204 @@ function connectToPeers(listofPeers) {
     });
 
     socket.on("error", (err) => {
-      console.error(`Failed to connect to ${ip}:${port} -- ${err.message}`);
+      console.error(`failed to connect to ${ip}:${port} -- ${err.message}`);
       socket.destroy();
     });
 
     socket.on("data", (data) => {
-      if (data.length <= 68) return console.log("incomplete handshake  ");
+      // Accumulate data in buffer for proper TCP stream handling
+      messageBuffer = Buffer.concat([messageBuffer, data]);
+      
+      // Handle handshake first
+      if (!handshakeComplete) {
+        if (messageBuffer.length < 68) return;
 
-      const pstrlen = data.readUInt8(0);
-      const pstr = data.toString("ascii", 1, 20);
-      const recievedInfoHash = data.subarray(28, 48);
-      console.log(data.subarray(48, 68).toString("hex"), "peeeer IIIDD");
+        const pstrlen = messageBuffer.readUInt8(0);
+        const pstr = messageBuffer.toString("ascii", 1, 20);
+        const receivedInfoHash = messageBuffer.subarray(28, 48);
 
-      if (
-        pstrlen === 19 &&
-        pstr === "BitTorrent protocol" &&
-        recievedInfoHash.equals(infoHash)
-      ) {
-        console.log("Handshake correct", socket.remoteAddress);
-      } else {
-        console.log("Invalid Handshake, closing socket");
-        // not destryoig right now cause there is bitfield hehe
-      }
-
-      // after 68 byte
-      const payload = data.subarray(68); // no need to use buffer.from cause subarry will return buffer with ref to same mem loc. slice?
-      console.log(payload.length, "paylod");
-
-      const length = payload.readUInt32BE(0); // might be 4byte length prefix
-      console.log(length, "lllllll"); //if not 0 then good, we are getting more things
-      const msgID = payload.readUInt8(4); // 1byte message id
-      const msgPayload = payload.subarray(5, 4 + length);
-
-      console.log(msgPayload, "msssgglLLoad");
-      console.log(msgPayload.length, "msgPayload Length");
-
-      console.log(msgID, "msssg idd");
-
-      const tp = getTotalPiece() / 20;
-      console.log(tp, "here my total piece divided by 20");
-      // console.log(Math.ceil(msgPayload.length / 8), "lets see what it got")
-
-      const totalPieces = getTotalPiece();
-
-      if (msgID === 5) {
-        for (let i = 0; i < msgPayload.length; i++) {
-          const byte = msgPayload[i];
-          for (let j = 0; j < 8; j++) {
-            const bitIndex = i * 8 + j;
-            if (bitIndex >= totalPieces) break; // stop if beyond total pieces
-            const hasPiece = (byte >> (7 - j)) & 1;
-            if (hasPiece) {
-              console.log(`peer has piece ${bitIndex}`);
-            }
-          }
+        if (pstrlen === 19 && pstr === "BitTorrent protocol" && receivedInfoHash.equals(infoHash)) {
+          console.log(`handshake successful with ${peerKey}`);
+          handshakeComplete = true;
+          messageBuffer = messageBuffer.subarray(68); // Remove handshake from buffer
+        } else {
+          console.log(`invalid handshake from ${peerKey}`);
+          socket.destroy();
+          return;
         }
       }
+
+      while (messageBuffer.length >= 4) {
+        const length = messageBuffer.readUInt32BE(0);
         
-    
+        // kee alive message
+        if (length === 0) {
+          messageBuffer = messageBuffer.subarray(4);
+          continue;
+        }
+        
+        // check if we have the complete message
+        if (messageBuffer.length < 4 + length) {
+          break; 
+        }
 
-      // const requestMsg = createRequest(51, 0, 16384); // request 16KB of piece 51
-      // socket.write(requestMsg);
+        const msgID = messageBuffer.readUInt8(4);
+        const msgPayload = messageBuffer.subarray(5, 4 + length);
 
-      // const bufferTo8BitInt = Uint32Array.from(bitfield)
-      // console.log(bufferTo8BitInt)
-      // console.log(bufferTo8BitInt, "there there")
+        if (msgID === 5) { // bifield
+          console.log(`bitfield from ${peerKey}`);
+          const availablePieces = new Set();
+          for (let i = 0; i < msgPayload.length; i++) {
+            const byte = msgPayload[i];
+            for (let j = 0; j < 8; j++) {
+              const bitIndex = i * 8 + j;
+              if (bitIndex >= totalPieces) break;
+              const hasPiece = (byte >> (7 - j)) & 1;
+              if (hasPiece) {
+                availablePieces.add(bitIndex);
+              }
+            }
+          }
+          
+          // Store peer state 
+          peerState.set(peerKey, { 
+            availablePieces, 
+            socket, 
+            choked: true,
+            interested: false,
+            downloading: undefined
+          });
+          
+          console.log(`${peerKey}: ${availablePieces.size}/${totalPieces} pieces`);
+          
+          // send interested message
+          const interestedMsg = createInterestedMessage();
+          socket.write(interestedMsg);
+          peerState.get(peerKey).interested = true;
+          cnt++;
+          console.log(`sent interested to ${peerKey} (${cnt} total peers)`);
+          
+        } else if (msgID === 1) { // UNCHOKE
+          console.log(`unchoke from ${peerKey} - can download`);
+          
+          const peer = peerState.get(peerKey);
+          if (peer) {
+            peer.choked = false;
+            requestNextPiece(peer, peerKey);
+          }
+          
+        } else if (msgID === 0) { // CHOKE
+          console.log(`choke from ${peerKey}`);
+          const peer = peerState.get(peerKey);
+          if (peer) peer.choked = true;
+          
+        } else if (msgID === 2) { // INTERESTED
+          console.log(`peer ${peerKey} is interested`);
+          
+        } else if (msgID === 3) { // NOT INTERESTED
+          console.log(`peer ${peerKey} is not interested`);
+          
+        } else if (msgID === 7) { // PIECE
+          const pieceIndex = msgPayload.readUInt32BE(0);
+          const begin = msgPayload.readUInt32BE(4);
+          const blockData = msgPayload.subarray(8);
+          
+          // track piece progress
+          if (!pieceProgress.has(pieceIndex)) {
+            const pieceSize = getPieceSize(pieceIndex);
+            pieceProgress.set(pieceIndex, {
+              size: pieceSize,
+              downloaded: 0,
+              blocks: new Map()
+            });
+          }
+          
+          const progress = pieceProgress.get(pieceIndex);
+          progress.blocks.set(begin, blockData);
+          progress.downloaded += blockData.length;
+          
+                    console.log(`piece ${pieceIndex}: ${progress.downloaded}/${progress.size} bytes (${Math.round(progress.downloaded/progress.size*100)}%)`);
+          
+          // Check if piece is complete
+          if (progress.downloaded >= progress.size) {
+            console.log(`piece ${pieceIndex} completed - assembling...`);
+            
+            // Assemble complete piece
+            const completeData = Buffer.alloc(progress.size);
+            for (const [blockOffset, block] of progress.blocks) {
+              block.copy(completeData, blockOffset);
+            }
+            
+            fs.writeFileSync(`${piecesDir}/piece_${pieceIndex}_complete.bin`, completeData);
+            downloadedPieces.add(pieceIndex);
+            pieceProgress.delete(pieceIndex);
+            
+            console.log(`saved piece ${pieceIndex} (${downloadedPieces.size}/${totalPieces} total)`);
+            
+            // Clear downloading flag for all peers
+            for (const [key, peerData] of peerState.entries()) {
+              if (peerData.downloading === pieceIndex) {
+                peerData.downloading = undefined;
+              }
+            }
+          }
+          
+          // Request next piece
+          const peer = peerState.get(peerKey);
+          if (peer && !peer.choked) {
+            requestNextPiece(peer, peerKey);
+          }
+          
+        } else {
+          console.log(`unknown message ${msgID} from ${peerKey}`);
+        }
 
-      // for(let i = 0; i < bitfield.length; i++){
-      //   const byte = bitfield[i];
-      // }
+        // Remove processed message from buffer
+        messageBuffer = messageBuffer.subarray(4 + length);
+      }
+        });
+
+    socket.on('close', () => {
+      console.log(`connection closed with ${peerKey}`);
+      peerState.delete(peerKey);
     });
   }
-}
 
-connectToPeers();
+  function requestNextPiece(peer, peerKey) {
+    if (!peer.availablePieces || peer.choked) return;
+    
+    // Don't request if peer is already downloading something
+    if (peer.downloading !== undefined) return;
+    
+    // Find a piece we need that this peer has
+    let targetPiece = null;
+    for (const pieceIndex of peer.availablePieces) {
+      if (!downloadedPieces.has(pieceIndex) && !pieceProgress.has(pieceIndex)) {
+        targetPiece = pieceIndex;
+        break;
+      }
+    }
+    
+    if (targetPiece === null) {
+      console.log(`no more pieces from ${peerKey} (${downloadedPieces.size}/${totalPieces} complete)`);
+      return;
+    }
+    
+    // Mark peer as downloading this piece
+    peer.downloading = targetPiece;
+    
+    console.log(`requesting piece ${targetPiece} from ${peerKey}`);
+    
+    // Request piece in 16KB blocks
+    const pieceSize = getPieceSize(targetPiece);
+    const BLOCK_SIZE = 16384;
+    
+    for (let offset = 0; offset < pieceSize; offset += BLOCK_SIZE) {
+      const blockSize = Math.min(BLOCK_SIZE, pieceSize - offset);
+      const requestMsg = createRequest(targetPiece, offset, blockSize);
+      peer.socket.write(requestMsg);
+    }
+    
+    console.log(`requested ${Math.ceil(pieceSize / BLOCK_SIZE)} blocks for piece ${targetPiece}`);
+  }
+}
